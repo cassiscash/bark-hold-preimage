@@ -4,6 +4,11 @@
 //! parameters fixed at invoice creation (htlc claim cltv delta, anti-dos
 //! token) live on the action as top-level fields; the mutable bit is
 //! [`Progress`], representing the current phase of the state machine.
+//!
+//! An invoice can also be created for a payment hash alone, with the
+//! preimage provided later (see [`crate::Wallet::provide_lightning_receive_preimage`]):
+//! such a receive waits in [`Progress::HtlcsReady`] until it gets the
+//! preimage or its claim window closes.
 
 use std::str::FromStr;
 use std::time::Duration;
@@ -77,7 +82,9 @@ pub struct LightningReceive {
 	// Set at invoice creation, immutable thereafter:
 	pub invoice: Bolt11Invoice,
 	pub payment_hash: PaymentHash,
-	pub payment_preimage: Preimage,
+	/// `None` until provided for a receive created for a payment hash
+	/// alone. Set once, and never changed afterwards.
+	pub payment_preimage: Option<Preimage>,
 	pub htlc_recv_cltv_delta: BlockDelta,
 	pub anti_dos_token: Option<String>,
 	#[serde(default)]
@@ -140,6 +147,16 @@ impl WalletAction for LightningReceive {
 				if is_htlc_claim_window_closed(wallet, htlcs).await.retry()? {
 					abandon_lightning_receive(wallet, &self, htlcs).await.retry()?;
 					return Ok(Advance::Done);
+				}
+
+				// A hash-only receive waits for its preimage, rechecking the
+				// claim window above on every wake.
+				if self.payment_preimage.is_none() {
+					return Ok(Advance::Park {
+						state: self,
+						wake_after: Some(AWAITING_PAYMENT_POLL_INTERVAL),
+						error: None,
+					});
 				}
 
 				// Preparing the claim can fail without consequence.
@@ -320,13 +337,20 @@ pub(crate) enum IncomingStatus {
 /// Mint a bolt11 invoice and build a fresh [`LightningReceive`] in
 /// [`Progress::AwaitingPayment`]. The executor persists the returned
 /// state; the caller is responsible for checkpoint existence checks.
+///
+/// With a `payment_hash`, the invoice is for that hash and the preimage
+/// stays unknown until provided; without, a fresh preimage is generated.
+/// `cltv_delta`, if given, is requested instead of the minimum, see
+/// [`crate::Bolt11InvoiceBuilder::cltv_delta`].
 pub(crate) async fn start_lightning_receive(
 	wallet: &Wallet,
+	payment_hash: Option<PaymentHash>,
 	amount: Amount,
 	description: Option<String>,
 	expiry: Option<Duration>,
 	token: Option<String>,
 	claim_destination: Option<ark::Address>,
+	cltv_delta: Option<BlockDelta>,
 ) -> anyhow::Result<LightningReceive> {
 	if amount == Amount::ZERO {
 		bail!("Cannot create invoice for 0 sats (this would create an explicit 0 sat invoice, not an any-amount invoice)");
@@ -343,16 +367,14 @@ pub(crate) async fn start_lightning_receive(
 	let fee = ark_info.fees.lightning_receive.calculate(amount).context("fee overflowed")?;
 	validate_and_subtract_fee(amount, fee)?;
 
-	// User needs to enforce the following delta:
-	// - vtxo exit delta + htlc expiry delta (time to exit the vtxo before the htlc expires)
-	// - vtxo exit margin (time to exit the vtxo before the htlc expires)
-	// - htlc recv claim delta (time to claim the htlc before it expires)
-	let requested_min_cltv_delta = ark_info.vtxo_exit_delta
-		.checked_add(ark_info.htlc_expiry_delta)
-		.and_then(|v| v.checked_add(config.vtxo_exit_margin))
-		.and_then(|v| v.checked_add(config.htlc_recv_claim_delta))
-		.and_then(|v| v.checked_add(LIGHTNING_PREPARE_CLAIM_DELTA))
-		.context("HTLC CLTV delta components sum overflows")?;
+	let min_cltv_delta = min_lightning_receive_cltv_delta(&ark_info, config)?;
+	let requested_min_cltv_delta = match cltv_delta {
+		Some(delta) if delta < min_cltv_delta => bail!(
+			"requested HTLC CLTV delta ({}) is less than the minimum: {}", delta, min_cltv_delta,
+		),
+		Some(delta) => delta,
+		None => min_cltv_delta,
+	};
 
 	if requested_min_cltv_delta > ark_info.max_user_invoice_cltv_delta {
 		bail!("HTLC CLTV delta ({}) is greater than Server's max HTLC recv CLTV delta: {}",
@@ -361,8 +383,13 @@ pub(crate) async fn start_lightning_receive(
 		);
 	}
 
-	let preimage = Preimage::random();
-	let payment_hash = preimage.compute_payment_hash();
+	let (payment_hash, preimage) = match payment_hash {
+		Some(hash) => (hash, None),
+		None => {
+			let preimage = Preimage::random();
+			(preimage.compute_payment_hash(), Some(preimage))
+		},
+	};
 	info!("Start bolt11 receive with payment hash: {}", payment_hash);
 
 	let mailbox_kp = wallet.inner.seed.to_mailbox_keypair();
@@ -406,6 +433,25 @@ pub(crate) async fn start_lightning_receive(
 		progress: Progress::AwaitingPayment,
 		claim_attempts: 0,
 	})
+}
+
+/// The smallest CLTV delta a receive can request: enough to exit its
+/// HTLC-recv vtxos unilaterally before the server can claim them back.
+///
+/// User needs to enforce the following delta:
+/// - vtxo exit delta + htlc expiry delta (time to exit the vtxo before the htlc expires)
+/// - vtxo exit margin (time to exit the vtxo before the htlc expires)
+/// - htlc recv claim delta (time to claim the htlc before it expires)
+pub(crate) fn min_lightning_receive_cltv_delta(
+	ark_info: &ark::ArkInfo,
+	config: &Config,
+) -> anyhow::Result<BlockDelta> {
+	ark_info.vtxo_exit_delta
+		.checked_add(ark_info.htlc_expiry_delta)
+		.and_then(|v| v.checked_add(config.vtxo_exit_margin))
+		.and_then(|v| v.checked_add(config.htlc_recv_claim_delta))
+		.and_then(|v| v.checked_add(LIGHTNING_PREPARE_CLAIM_DELTA))
+		.context("HTLC CLTV delta components sum overflows")
 }
 
 /// Build the anti-dos proof for a claim: an explicit token if the caller
@@ -637,7 +683,7 @@ async fn prepare_lightning_receive_htlcs(
 				.context("htlc amount out of range").abort()?)
 			.fee(fee)
 			.metadata(LightningMovement::metadata(
-				payment_hash, &vtxos, Some(recv.payment_preimage),
+				payment_hash, &vtxos, recv.payment_preimage,
 			))
 			.received_on([MovementDestination::new(recv.invoice.clone().into(), received)]),
 	).await.context("failed to create lightning receive movement").retry()?;
@@ -718,12 +764,14 @@ async fn claim_lightning_receive_htlcs(
 	claim: PreparedClaim,
 ) -> Result<Option<Delivery>, AdvanceError> {
 	let PreparedClaim { mut srv, builder, keypairs } = claim;
+	let preimage = recv.payment_preimage
+		.context("cannot claim a lightning receive without its preimage").abort()?;
 
 	info!("Claiming arkoor against payment preimage for {}", recv.payment_hash);
 	let package_cosign_request = protos::ArkoorPackageCosignRequest::from(builder.cosign_request());
 	let resp = srv.client.claim_lightning_receive(protos::ClaimLightningReceiveRequest {
 		payment_hash: recv.payment_hash.to_byte_array().to_vec(),
-		payment_preimage: recv.payment_preimage.to_vec(),
+		payment_preimage: preimage.to_vec(),
 		cosign_request: Some(package_cosign_request),
 	}).await.retry_unless_rejected()?.into_inner();
 
@@ -789,7 +837,7 @@ async fn claim_lightning_receive_htlcs(
 
 	let amount = recv.invoice.get_payment_amount(None).unwrap_or(effective_balance);
 	wallet.inner.db.record_settled_lightning_receive(
-		recv.payment_hash, recv.payment_preimage, &recv.invoice, amount,
+		recv.payment_hash, preimage, &recv.invoice, amount,
 	).await.retry()?;
 
 	Ok(None)
@@ -820,9 +868,11 @@ async fn deliver_lightning_receive(
 			.sent_to([MovementDestination::ark(destination.clone(), delivered)]),
 	).await.context("failed to finish lightning receive movement").retry()?;
 
+	let preimage = recv.payment_preimage
+		.context("delivering receive has no preimage").abort()?;
 	let amount = recv.invoice.get_payment_amount(None).unwrap_or(delivered);
 	wallet.inner.db.record_settled_lightning_receive(
-		recv.payment_hash, recv.payment_preimage, &recv.invoice, amount,
+		recv.payment_hash, preimage, &recv.invoice, amount,
 	).await.retry()?;
 
 	Ok(())
