@@ -8,12 +8,13 @@ use log::{error, info, warn};
 use server_rpc::protos;
 
 use ark::lightning::{Bolt11InvoiceExt, Preimage, PaymentHash};
+use bitcoin_ext::BlockDelta;
 
 use crate::Wallet;
 use crate::actions::{DriveMode, WalletAction};
 use crate::actions::lightning::receive::{
 	Htlcs, LightningReceive, LightningReceiveState, Progress,
-	ln_recv_action_id, start_lightning_receive
+	ln_recv_action_id, min_lightning_receive_cltv_delta, start_lightning_receive
 };
 use crate::movement::MovementStatus;
 use crate::movement::update::MovementUpdate;
@@ -31,12 +32,16 @@ pub struct Bolt11InvoiceBuilder<'a> {
 	expiry: Option<Duration>,
 	token: Option<String>,
 	claim_destination: Option<ark::Address>,
+	payment_hash: Option<PaymentHash>,
+	cltv_delta: Option<BlockDelta>,
 }
 
 impl<'a> Bolt11InvoiceBuilder<'a> {
 	pub fn new(wallet: &'a Wallet) -> Self {
 		Self {
 			wallet,
+			payment_hash: None,
+			cltv_delta: None,
 			amount: None,
 			description: None,
 			expiry: None,
@@ -100,6 +105,35 @@ impl<'a> Bolt11InvoiceBuilder<'a> {
 		self
 	}
 
+	/// Create the invoice for this payment hash instead of a fresh
+	/// preimage's, for a hold invoice whose preimage is known elsewhere.
+	///
+	/// Once the server holds the payment's HTLCs, the receive waits until
+	/// [`Wallet::provide_lightning_receive_preimage`] gives it the
+	/// preimage. It must come before the claim window closes, which leaves
+	/// enough blocks to exit the HTLC vtxos unilaterally: after that the
+	/// receive is abandoned and the payer refunded. Watch for the HTLCs
+	/// with [`Wallet::lightning_receive_checkpoint`], whose progress turns
+	/// [`Progress::HtlcsReady`].
+	pub fn payment_hash(mut self, payment_hash: impl Into<Option<PaymentHash>>) -> Self {
+		self.payment_hash = payment_hash.into();
+		self
+	}
+
+	/// The CLTV delta to ask the server for, instead of
+	/// [`Wallet::min_lightning_receive_cltv_delta`]. Must be at least that
+	/// and at most the server's `max_user_invoice_cltv_delta`; the invoice's
+	/// final CLTV delta is this plus the server's `htlc_expiry_delta`.
+	///
+	/// Every block above the minimum is a block the claim window stays open
+	/// after the server grants the HTLCs: by default it closes about one
+	/// block after, which leaves a receive created with
+	/// [`Self::payment_hash`] next to no time to get its preimage.
+	pub fn cltv_delta(mut self, cltv_delta: impl Into<Option<BlockDelta>>) -> Self {
+		self.cltv_delta = cltv_delta.into();
+		self
+	}
+
 	/// Mint the invoice and persist an `AwaitingPayment` checkpoint for it.
 	///
 	/// This does not wait for payment. The background sync (or an explicit
@@ -108,8 +142,8 @@ impl<'a> Bolt11InvoiceBuilder<'a> {
 	pub async fn build(self) -> anyhow::Result<Bolt11Invoice> {
 		let amount = self.amount.context("an invoice amount is required")?;
 		let start = start_lightning_receive(
-			self.wallet, amount, self.description, self.expiry, self.token,
-			self.claim_destination,
+			self.wallet, self.payment_hash, amount, self.description, self.expiry, self.token,
+			self.claim_destination, self.cltv_delta,
 		).await?;
 		let invoice = start.invoice.clone();
 		let mut checkpoint = self.wallet.try_lock_action::<LightningReceive>(&start.id()).await?
@@ -120,6 +154,13 @@ impl<'a> Bolt11InvoiceBuilder<'a> {
 }
 
 impl Wallet {
+	/// The smallest CLTV delta a lightning receive can request from the
+	/// server, see [`Bolt11InvoiceBuilder::cltv_delta`].
+	pub async fn min_lightning_receive_cltv_delta(&self) -> anyhow::Result<BlockDelta> {
+		let (_, ark_info) = self.require_server().await?;
+		min_lightning_receive_cltv_delta(&ark_info, self.config())
+	}
+
 	/// Returns every in-progress lightning receive checkpoint, newest first.
 	pub async fn pending_lightning_receives(&self) -> anyhow::Result<Vec<LightningReceive>> {
 		let mut result = Vec::new();
@@ -188,7 +229,7 @@ impl Wallet {
 			return Ok(Some(settled.preimage));
 		}
 		if let Some(cp) = self.lightning_receive_checkpoint(hash).await? {
-			return Ok(Some(cp.payment_preimage));
+			return Ok(cp.payment_preimage);
 		}
 		Ok(None)
 	}
@@ -372,12 +413,49 @@ impl Wallet {
 		// We only exit once the preimage has been revealed (Claiming phase), so
 		// record it permanently: the exit subsystem needs it to witness the
 		// on-chain HTLC-recv spend, possibly after this checkpoint is gone.
+		let preimage = recv.payment_preimage
+			.context("cannot exit a lightning receive without its preimage")?;
 		let amount = recv.invoice.get_payment_amount(None).unwrap_or(Amount::ZERO);
 		self.inner.db.record_settled_lightning_receive(
-			recv.payment_hash, recv.payment_preimage, &recv.invoice, amount,
+			recv.payment_hash, preimage, &recv.invoice, amount,
 		).await?;
 
 		Ok(())
+	}
+
+	/// Give a receive created with [`Bolt11InvoiceBuilder::payment_hash`]
+	/// its preimage, and claim the payment if its HTLCs are already held.
+	///
+	/// Fails if the preimage does not match the payment hash, or if the
+	/// receive has ended (its claim window closed or it was canceled).
+	/// Providing the same preimage again only drives the receive. Returns
+	/// the state after driving the receive to its next park.
+	pub async fn provide_lightning_receive_preimage(
+		&self,
+		hash: PaymentHash,
+		preimage: Preimage,
+	) -> anyhow::Result<LightningReceiveState> {
+		ensure!(preimage.compute_payment_hash() == hash,
+			"preimage does not match payment hash {}", hash,
+		);
+		if self.inner.db.get_settled_lightning_receive(hash).await?.is_some() {
+			return self.lightning_receive_state(hash).await;
+		}
+		{
+			// Don't fight a live drive of the same action.
+			let mut checkpoint = self.try_lock_action::<LightningReceive>(&ln_recv_action_id(hash))
+				.await?
+				.context("receive operation already in progress for this payment")?;
+			let known = checkpoint.get()
+				.context("no pending lightning receive found for this payment hash")?
+				.payment_preimage;
+			match known {
+				Some(known) if known == preimage => {},
+				Some(_) => bail!("lightning receive {} already has another preimage", hash),
+				None => checkpoint.update(self, |recv| recv.payment_preimage = Some(preimage)).await?,
+			}
+		}
+		self.try_claim_lightning_receive(hash, false).await
 	}
 
 	/// Drive a lightning receive forward (e.g. to claim an inbound payment).
