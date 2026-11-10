@@ -11,13 +11,17 @@ readme = "README.md"
 [features]
 default = ["rand", "sqlite", "native", "tls-native-roots", "bitcoind-rpc"]
 
-onchain-bdk = ["bdk_wallet", "bark-bitcoin-ext/bdk"]
+# bdk_chain's `rusqlite` feature pins rusqlite 0.31, while bark uses 0.32
+# to coexist with ark-client's contract store (Cargo allows only one
+# `links = "sqlite3"`). Enabling `onchain-bdk` therefore also requires a
+# bdk_chain built against rusqlite 0.32; the default/sqlite build does not.
+onchain-bdk = ["bdk_wallet", "bark-bitcoin-ext/bdk", "bdk_wallet/rusqlite"]
 
 # Native bitcoind JSON-RPC backend for the on-chain layer.
 bitcoind-rpc = ["dep:bitcoind-async-client", "dep:zeromq", "bark-bitcoin-ext/rpc-async"]
 
 # The default persistence
-sqlite = ["rusqlite", "bdk_wallet/rusqlite"]
+sqlite = ["rusqlite"]
 # Compile SQLite from source instead of linking against the system library; useful for cross-compilation.
 sqlite-bundled = ["sqlite", "rusqlite/bundled"]
 # Used for testing, enables testing storage adaptor implementation
@@ -108,7 +112,7 @@ web-sys = { version = "0.3.83", optional = true }
 serde-wasm-bindgen = { version = "0.6.5", optional = true }
 
 # Storage clients crates
-rusqlite = { version = "0.31.0", features = ["chrono"], optional = true }
+rusqlite = { version = "0.32.0", features = ["chrono"], optional = true }
 
 wasm-bindgen-futures = { version = "0.4.56", optional = true }
 # Used by lock_manager::web_locks to call navigator.locks via js-sys::Reflect.
